@@ -20,21 +20,31 @@ class DialogueSplitter:
 
     def __call__(self):
 
-        self.index = {}
+        frames = []
 
         with open(self.text_file) as f:
+
+            text = ""
+            role = None
+
             while True:
                 line = f.readline()
                 if not line:
                     break
 
-                row  = []
                 speaker = self.__speaker__(line)
                 if speaker:
-                    print(f"SPEAKER {speaker}")
+                    role = speaker.strip()
+
                 else:
                     if line == "\n":
-                        print("end of dialogue")
-                        # TODO: pop row into index
+                        text = re.sub("[.,!?\\-]", '', text.lower())
+                        frames.append([role, text.strip()])
+                        role = None
+                        text = ""
+
                     else:
-                        row.append(line.strip())
+                        text += line.strip() + " "
+
+        return pd.DataFrame(data = frames, columns = ['speaker', 'text'])
+
