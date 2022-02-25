@@ -7,6 +7,14 @@ https://neptune.ai/blog/how-to-code-bert-using-pytorch-tutorial
 
 And then severely hacked together to make more sense,
 be more readable, better documented and expanded upon
+
+More information can be found here:
+    https://medium.com/analytics-vidhya/bert-implementation-multi-head-attention-4a10142636fe
+
+A great visualisation of the BERT model can be found here:
+    https://peltarion.com/knowledge-center/documentation/modeling-view/build-an-ai-model/blocks/bert-encoder
+
+TODO: READ THE ABOVE and WATCH THE YOUTUBE VIDEO!
 """
 
 class Embedding(nn.Module):
@@ -26,13 +34,13 @@ class Embedding(nn.Module):
             https://pytorch.org/docs/stable/generated/torch.nn.Embedding.html
             https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
         """
-        ddim   = 768
+        d_model   = 768
         maxlen = 512
         n_seg  = 2
-        self.tok_embed = nn.Embedding(vocab_size, ddim)  	# token embedding
-        self.pos_embed = nn.Embedding(maxlen, ddim)  		# position embedding
-        self.seg_embed = nn.Embedding(n_segments, ddim)  	# segment(token type) embedding
-        self.norm = nn.LayerNorm(ddim)
+        self.tok_embed = nn.Embedding(vocab_size, d_model)  	# token embedding
+        self.pos_embed = nn.Embedding(maxlen, d_model)  	# position embedding
+        self.seg_embed = nn.Embedding(n_segments, d_model)  	# segment(token type) embedding
+        self.norm = nn.LayerNorm(d_model)
 
 
     def forward(self, x, seg):
@@ -58,7 +66,8 @@ class Embedding(nn.Module):
         """
         seq_len = x.size(1)
         pos = torch.arange(seq_len, dtype=torch.long)
-        pos = pos.unsqueeze(0).expand_as(x)  			# (seq_len,) -> (batch_size, seq_len)
+        # (seq_len,) -> (batch_size, seq_len)
+        pos = pos.unsqueeze(0).expand_as(x)
         embedding = self.tok_embed(x) + self.pos_embed(pos) + self.seg_embed(seg)
         return self.norm(embedding)
 
@@ -73,21 +82,82 @@ def get_attn_pad_mask(seq_q, seq_k):
     a binary tensor indicating the position of the padded indices so that the model does not attend to them,
     which makes sense.
 
+    For example:
+    >>>
+    (tensor([False, False, False, False, False, False, False, False, False, False,
+             False, False, False,  True,  True,  True,  True,  True,  True,  True,
+             True,  True,  True,  True,  True,  True,  True,  True,  True,  True]),
+    tensor([ 1,  3, 26, 21, 14, 16, 12,  4,  2, 27,  3, 22,  2,  0,  0,  0,  0,  0,
+            0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0]))
+
     See here for more:
         https://huggingface.co/docs/transformers/glossary#attention-mask
     """
     batch_size, len_q = seq_q.size()
     batch_size, len_k = seq_k.size()
     # eq(zero) is PAD token
-    pad_attn_mask = seq_k.data.eq(0).unsqueeze(1)  # batch_size x 1 x len_k(=len_q), one is masking
-    return pad_attn_mask.expand(batch_size, len_q, len_k)  # batch_size x len_q x len_k
+    # batch_size x 1 x len_k(=len_q), one is masking
+    pad_attn_mask = seq_k.data.eq(0).unsqueeze(1)
+    # batch_size x len_q x len_k
+    return pad_attn_mask.expand(batch_size, len_q, len_k)
+
+
+class PoswiseFeedForwardNet(nn.Module):
+    """Position Wise Feed Forward Network
+    see:
+        https://nn.labml.ai/transformers/feed_forward.html
+        https://github.com/Skumarr53/Attention-is-All-you-Need-PyTorch/blob/master/transformer/model.py#L97
+
+    In practise, what this does is *filter* the encodings from the Multi-Head attention
+    by using an Activation function and a normalisation thereafter.
+
+    The application of the Poswise propagation is applied separately and identically to each
+    output.
+
+    The author of the Github code used a self-coded version of GeLU, a Gaussian Error Linear Unit:
+        https://pytorch.org/docs/stable/generated/torch.nn.GELU.html
+
+    Other sources I have seen online use a ReLU.
+    Apparently GeLU is slowly replacing ReLU in SOTA, as it has a well define dgradient in the negative space.
+
+    __NOTE__: Keras implementations use a Conv1D here instead of a FF Network.
+              The effect should be *mathematically* identical but the backend process may
+              be different w.t.r. to parallelism.
+
+    >>> The design of smaller to larger and then back to smaller layers resembles that
+    of a Sparse Auto-Encoder. What  this (in theory) allows is to have a Gaussian process
+    which can *sample* any function you like. The wider the network, the more approximation.
+    However, this may bloat the boundary with identifiability issues. A solution to this is to
+    add L1 Regularisation.
+
+    See:
+        https://ai.stackexchange.com/questions/15524/why-would-you-implement-the-position-wise-feed-forward-network-of-the-transforme
+    """
+    def __init__(self, d_model, d_ff):
+        d_model   = 768
+        d_ff      = 2048
+
+        super(PoswiseFeedForwardNet, self).__init__()
+        self.l1 = nn.Linear(d_model, d_ff)
+        self.l2 = nn.Linear(d_ff, d_model)
+        self.activation = nn.GELU()
+        self.layer_norm = nn.LayerNorm(d_model)
+
+
+    def forward(self, inputs):
+        residual = inputs
+        output = self.l1(inputs)
+        output = self.activation(output)
+        output = self.l2(output)
+        return self.layer_norm(output + residual)
 
 
 class EncoderLayer(nn.Module):
     """
-    Encoder Layer for BERT reconstructed for brevity
+    Encoder Layer for BERT:
+        - contains a Multi-Head Attention Layer
+        - contains a Position Wise Feed Forward Net
     """
-    # TODO: read, document, understand, explain
     def __init__(self):
         """
         There's two parts to the Encoder Layer:
@@ -107,7 +177,6 @@ class EncoderLayer(nn.Module):
         For more info on the Heads, read:
             https://stackoverflow.com/questions/69436845/bert-heads-count
 
-        TODO: PosWiseFeedForwardNet
         """
         embed_dim = 768
         num_heads = 12
@@ -116,13 +185,35 @@ class EncoderLayer(nn.Module):
         self.pos_ffn = PoswiseFeedForwardNet()
 
     def forward(self, enc_inputs, enc_self_attn_mask):
-        enc_outputs, attn = self.enc_self_attn(enc_inputs, enc_inputs, enc_inputs, enc_self_attn_mask) # enc_inputs to same Q,K,V
-        enc_outputs = self.pos_ffn(enc_outputs) # enc_outputs: [batch_size x len_q x d_model]
+        """Encode and Forward Propagate:
+        Return the encoded outputs and the attention tensor.
+
+        In order to understand what the encoded attention operation does, see:
+            https://github.com/Skumarr53/Attention-is-All-you-Need-PyTorch/blob/master/Snapshots/Attention_compute.png
+            https://github.com/Skumarr53/Attention-is-All-you-Need-PyTorch/blob/master/Snapshots/Attention_putput.png
+
+        Whereas the Position Wise Feed Forward Network does this:
+            https://raw.githubusercontent.com/Skumarr53/Attention-is-All-you-Need-PyTorch/master/Snapshots/MultiHead_Attention.png
+        """
+        # enc_inputs to same Q,K,V
+        enc_outputs, attn = self.enc_self_attn(enc_inputs, enc_inputs, enc_inputs, enc_self_attn_mask)
+
+        # enc_outputs: [batch_size x len_q x d_model]
+        enc_outputs = self.pos_ffn(enc_outputs) 
         return enc_outputs, attn
 
 
 
 class BERT(nn.Module):
+    """The fully assembled BERT model has the following:
+
+    - The embedding layer
+    - a list of Encoder Layer blocks (each one with a Multi-Head Addention and a Position Wise Forward Net
+    - in the middle there's two Linear Layers with a Tanh, a GELU and Normalisation
+    - Finally, there's a Decoder; it shares the Embedding Weights with the Encoder
+
+    TODO: Finish this model, and write a training method for it
+    """
    def __init__(self):
        super(BERT, self).__init__()
        self.embedding = Embedding()
