@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 """
@@ -14,7 +15,8 @@ More information can be found here:
 A great visualisation of the BERT model can be found here:
     https://peltarion.com/knowledge-center/documentation/modeling-view/build-an-ai-model/blocks/bert-encoder
 
-TODO: READ THE ABOVE and WATCH THE YOUTUBE VIDEO!
+A dissection of BERT can be found here:
+    https://datasciencetoday.net/index.php/en-us/nlp/211-paper-dissected-bert-pre-training-of-deep-bidirectional-transformers-for-language-understanding-explained
 """
 
 class Embedding(nn.Module):
@@ -37,9 +39,17 @@ class Embedding(nn.Module):
         d_model   = 768
         maxlen = 512
         n_seg  = 2
-        self.tok_embed = nn.Embedding(vocab_size, d_model)  	# token embedding
-        self.pos_embed = nn.Embedding(maxlen, d_model)  	# position embedding
-        self.seg_embed = nn.Embedding(n_segments, d_model)  	# segment(token type) embedding
+
+        # token embedding
+        self.tok_embed = nn.Embedding(vocab_size, d_model)
+
+        # position embedding
+        self.pos_embed = nn.Embedding(maxlen, d_model)
+
+        # segment(token type) embedding
+        self.seg_embed = nn.Embedding(n_seg, d_model)
+
+        # Normalisation
         self.norm = nn.LayerNorm(d_model)
 
 
@@ -133,7 +143,7 @@ class PoswiseFeedForwardNet(nn.Module):
     See:
         https://ai.stackexchange.com/questions/15524/why-would-you-implement-the-position-wise-feed-forward-network-of-the-transforme
     """
-    def __init__(self, d_model, d_ff):
+    def __init__(self):
         d_model   = 768
         d_ff      = 2048
 
@@ -188,6 +198,10 @@ class EncoderLayer(nn.Module):
         """Encode and Forward Propagate:
         Return the encoded outputs and the attention tensor.
 
+        Args:
+            enc_inputs: The encoded token id tensor
+            enc_self_attn_mask: the masked tensor for positions which should have attention
+
         In order to understand what the encoded attention operation does, see:
             https://github.com/Skumarr53/Attention-is-All-you-Need-PyTorch/blob/master/Snapshots/Attention_compute.png
             https://github.com/Skumarr53/Attention-is-All-you-Need-PyTorch/blob/master/Snapshots/Attention_putput.png
@@ -211,41 +225,98 @@ class BERT(nn.Module):
     - a list of Encoder Layer blocks (each one with a Multi-Head Addention and a Position Wise Forward Net
     - in the middle there's two Linear Layers with a Tanh, a GELU and Normalisation
     - Finally, there's a Decoder; it shares the Embedding Weights with the Encoder
-
-    TODO: Finish this model, and write a training method for it
     """
-   def __init__(self):
-       super(BERT, self).__init__()
-       self.embedding = Embedding()
-       self.layers = nn.ModuleList([EncoderLayer() for _ in range(n_layers)])
-       self.fc = nn.Linear(d_model, d_model)
-       self.activ1 = nn.Tanh()
-       self.linear = nn.Linear(d_model, d_model)
-       self.activ2 = gelu
-       self.norm = nn.LayerNorm(d_model)
-       self.classifier = nn.Linear(d_model, 2)
-       # decoder is shared with embedding layer
-       embed_weight = self.embedding.tok_embed.weight
-       n_vocab, n_dim = embed_weight.size()
-       self.decoder = nn.Linear(n_dim, n_vocab, bias=False)
-       self.decoder.weight = embed_weight
-       self.decoder_bias = nn.Parameter(torch.zeros(n_vocab))
+    def __init__(self, vocab_size):
+        super(BERT, self).__init__()
+        """
+        BERT has:
+            1. Embedding Layer
+            2. 12 Encoding Layers, each one made of a MultiHead Attention and a Poswise Feed Forward Net
+            3. One Tanh Activation
+            4. one Linear Projection
+            5. one GELU activation
+            6. one Layer Normalisation
+            7. one Linear Projection (classification)
+            8. Shared Embedding Weights (Encoder) for the Decoder with
+               one Linear Projection using the Decoder weights
+        """
+        n_layers = 12
+        d_model  = 768
+        self.embedding = Embedding(vocab_size)
+        self.layers = nn.ModuleList(
+            [EncoderLayer() for _ in range(n_layers)]
+        )
 
-   def forward(self, input_ids, segment_ids, masked_pos):
-       output = self.embedding(input_ids, segment_ids)
-       enc_self_attn_mask = get_attn_pad_mask(input_ids, input_ids)
-       for layer in self.layers:
+        self.fc = nn.Linear(d_model, d_model)
+        self.activ1 = nn.Tanh()
+
+        self.linear = nn.Linear(d_model, d_model)
+        self.activ2 = nn.GELU()
+
+        # The classifier will tell us CLSF
+        self.norm = nn.LayerNorm(d_model)
+        self.classifier = nn.Linear(d_model, 2)
+
+        # decoder is shared with embedding layer
+        embed_weight = self.embedding.tok_embed.weight
+        n_vocab, n_dim = embed_weight.size()
+
+        # Decoder's Linear Projection is Embedding's dimension x vocab size
+        # so 768 x vocabulary size
+        self.decoder = nn.Linear(n_dim, n_vocab, bias=False)
+        self.decoder.weight = embed_weight
+        self.decoder_bias = nn.Parameter(torch.zeros(n_vocab))
+
+
+    def forward(self, input_ids, segment_ids, masked_pos):
+        """Forward Propagation.
+
+        Args:
+            input_ids   : the input token ids
+            segment_ids : defines which tokens below to which sentence (for question - answering)
+            masked_pos  : the position of masks (aka `attention_mask`)
+
+        Forward Propagation will do the following:
+        - create embeddings
+        - create attention mask padding
+        - propagate through the successive encoding layers
+        - run through the activation and linear projection layer
+        - get the pooled output and then run in through the classifier
+        - this gives CLSF
+        - then the Masked Position, it will **alter** the output
+        - then it runs it htrough the linear layer, activation and normalisation
+        - and finally it runs that masked output through the decoder and adds the bias
+        - this results in the logits being returned
+        """
+        output = self.embedding(input_ids, segment_ids)
+        #
+        # NOTE: HuggingFace Tokenizer has already calculated Attention Mask for Padded Sequences
+        #       but as a binary mask, whereas this method below will translate the encoded tensor
+        #       by keeping intact the Attention values and masking with Zero the non-attention values
+        #
+        enc_self_attn_mask = get_attn_pad_mask(input_ids, input_ids)
+        for layer in self.layers:
            output, enc_self_attn = layer(output, enc_self_attn_mask)
-       # output : [batch_size, len, d_model], attn : [batch_size, n_heads, d_mode, d_model]
-       # it will be decided by first token(CLS)
-       h_pooled = self.activ1(self.fc(output[:, 0])) # [batch_size, d_model]
-       logits_clsf = self.classifier(h_pooled) # [batch_size, 2]
 
-       masked_pos = masked_pos[:, :, None].expand(-1, -1, output.size(-1)) # [batch_size, max_pred, d_model]
+        # output : [batch_size, len, d_model], attn : [batch_size, n_heads, d_mode, d_model]
+        # it will be decided by first token(CLS)
 
-       # get masked position from final output of transformer.
-       h_masked = torch.gather(output, 1, masked_pos) # masking position [batch_size, max_pred, d_model]
-       h_masked = self.norm(self.activ2(self.linear(h_masked)))
-       logits_lm = self.decoder(h_masked) + self.decoder_bias # [batch_size, max_pred, n_vocab]
+        # [batch_size, d_model]
+        h_pooled = self.activ1(self.fc(output[:, 0]))
 
-       return logits_lm, logits_clsf
+        # [batch_size, 2]
+        logits_clsf = self.classifier(h_pooled)
+
+        # [batch_size, max_pred, d_model]
+        masked_pos = masked_pos[:, :, None].expand(-1, -1, output.size(-1))
+
+        # get masked position from final output of transformer.
+
+        # masking position [batch_size, max_pred, d_model]
+        h_masked = torch.gather(output, 1, masked_pos)
+        h_masked = self.norm(self.activ2(self.linear(h_masked)))
+
+        # [batch_size, max_pred, n_vocab]
+        logits_lm = self.decoder(h_masked) + self.decoder_bias
+
+        return logits_lm, logits_clsf
