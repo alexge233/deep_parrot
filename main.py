@@ -5,6 +5,9 @@ from tokenizers.processors import TemplateProcessing
 import pandas as pd
 import torch
 import model
+import random
+
+torch.set_printoptions(linewidth=200)
 
 """
     This is a Language Modelling Task, using Shakespearing English
@@ -34,14 +37,24 @@ def create_bert_vocab():
     tokenizer.save('shakespeare_bert_tokenizer.json', pretty=True)
 
 
-# TODO: randomly pad up to 15% of the NON-MASKED tensor values
-#       1. get the non-zero size (e.g., the unmasked and unpadded ones)
-#       2. pick up to 15% of their indices
-#       3. replace those indices with Zeros
-#
 def random_mask(arg):
-    #non_zeros = 
-    pass
+    """Randomly pad **UP TO 15%** of the NON-MASKED tensor values.
+    We use Python's PRNG to chose how many NON-MASKED values we'll pad
+    and then we use Python's PRNG to chose which indices to randomly MASK.
+
+    I tried with numpy but wasn't happy about it, so using Python for this.
+    Should be done in-memory so is most likely performant.
+    """
+    full_size = arg.size()[0]
+    non_zeros = torch.nonzero(arg).squeeze()
+    max_idx   = non_zeros.size()[0]
+    r_num     = random.randint(0, int(max_idx * 0.15))
+    r_indices = [random.randint(0,max_idx) for x in range(0, r_num)]
+
+    if len(r_indices) > 0:
+        return arg.index_fill(0, torch.tensor(r_indices), 0)
+    else:
+        return arg
 
 
 def load_tensors(df: pd.DataFrame, tokenizer):
@@ -63,13 +76,6 @@ def load_tensors(df: pd.DataFrame, tokenizer):
     data  = []
     batch = tokenizer.encode_batch(df['text'].tolist())
     for encoded in batch:
-        #print(f"Tokens: {encoded.tokens}")
-        #print(f"Token IDS (Input ID): {encoded.ids}")
-        #print(f"Sequence IDS: {encoded.sequence_ids}")
-        #print(f"Attention Mask: {encoded.attention_mask}")
-        #print(f"Word IDS {encoded.word_ids}")
-        #print(f"Type IDS {encoded.type_ids}")
-
         tok_ids = torch.ShortTensor(encoded.ids)
         seg_ids = encoded.sequence_ids
         seg_ids = [1 if x == 0 else 0 for x in seg_ids]
