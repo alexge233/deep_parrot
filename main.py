@@ -4,6 +4,8 @@ from tokenizers import BertWordPieceTokenizer
 from tokenizers.processors import TemplateProcessing
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import model
 import random
 
@@ -37,24 +39,26 @@ def create_bert_vocab():
     tokenizer.save('shakespeare_bert_tokenizer.json', pretty=True)
 
 
-def random_mask(arg):
+def random_mask(input_ids, masks):
     """Randomly pad **UP TO 15%** of the NON-MASKED tensor values.
     We use Python's PRNG to chose how many NON-MASKED values we'll pad
     and then we use Python's PRNG to chose which indices to randomly MASK.
 
     I tried with numpy but wasn't happy about it, so using Python for this.
     Should be done in-memory so is most likely performant.
+
+    We use the Mask Tensor instead of the Raw values (which is what is happening now)
     """
-    full_size = arg.size()[0]
-    non_zeros = torch.nonzero(arg).squeeze()
-    max_idx   = non_zeros.size()[0]
+    full_size = input_ids.size()[0]
+    non_zeros = torch.nonzero(input_ids).squeeze()
+    max_idx   = non_zeros.size()[0] -1
     r_num     = random.randint(0, int(max_idx * 0.15))
     r_indices = [random.randint(0,max_idx) for x in range(0, r_num)]
 
-    if len(r_indices) > 0:
-        return arg.index_fill(0, torch.tensor(r_indices), 0)
+    if len(r_indices) > 0 and masks.size()[0] == 512:
+        return masks.index_fill(0, torch.tensor(r_indices), 0)
     else:
-        return arg
+        return masks
 
 
 def load_tensors(df: pd.DataFrame, tokenizer):
@@ -76,10 +80,10 @@ def load_tensors(df: pd.DataFrame, tokenizer):
     data  = []
     batch = tokenizer.encode_batch(df['text'].tolist())
     for encoded in batch:
-        tok_ids = torch.ShortTensor(encoded.ids)
+        tok_ids = torch.IntTensor(encoded.ids)
         seg_ids = encoded.sequence_ids
         seg_ids = [1 if x == 0 else 0 for x in seg_ids]
-        seg_ids = torch.ShortTensor(seg_ids)
+        seg_ids = torch.IntTensor(seg_ids)
         msk_ids = torch.BoolTensor(encoded.attention_mask)
         t_row   = torch.stack((tok_ids, seg_ids, msk_ids))
         data.append(t_row)
@@ -90,28 +94,6 @@ def datasplit(df: pd.DataFrame) -> tuple:
     df_train = df.sample(frac = 0.70)
     df_test  = df.drop(df_train.index)
     return df_train, df_test
-
-
-def training(vocab_size, tokenizer, data):
-    bert = model.BERT(vocab_size)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    loader = torch.utils.data.DataLoader(data,
-                                         batch_size = 32,
-                                         shuffle = True,
-                                         pin_memory = False)
-
-    for epoch in range(100):
-        optimizer.zero_grad()
-        for batch_ndx, sample in enumerate(loader):
-            # TODO: randomly mask the 1st tensor which contains the token ids
-            #       then upload to GPU and propagate
-            #       
-            #       See the rest of the code online
-            #       and implement a similar approach, using tensorboard to monitor
-            #       and track the experiments
-            #
-            print(batch_ndx, sample)
 
 
 if __name__ == "__main__":
@@ -164,4 +146,66 @@ if __name__ == "__main__":
     and populating the GPU memory with tensors which contain the token ids, segment ids and mask ids.
     """
     train_data = load_tensors(train_df, tokenizer)
-    training(vocab_size, tokenizer, train_data)
+
+    """
+    Setup Model, Criterion, Optimizer, Data Loader.
+    Start putting all data on GPU now, and note that I've only got a GTX1080Ti
+    so, my hard GPU limit is 12Gb which won't run with a batch of 16 or 32.
+    Batch of 8 runs, might be able to squeeze a few more but that's it.
+    """
+    network = model.BERT(vocab_size).to('cuda')
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(network.parameters(), lr=0.001)
+    loader = torch.utils.data.DataLoader(train_data,
+                                         batch_size = 24,
+                                         shuffle = True,
+                                         pin_memory = False)
+
+    for epoch in range(40):
+        optimizer.zero_grad()
+        losses = []
+        for batch_ndx, samples in enumerate(loader):
+            """
+            Sample is a 3-dim tensor
+            1st Dim is the Batch
+
+            2nd Dim is the Sample Tensor
+
+            3rd Dim the the Tensor values:
+                - input ids
+                - segment ids
+                - masks
+
+
+            We need to manually randomly mask the token input ids and then
+            upload all the data to CUDA memory.
+            """
+            input_ds  = torch.zeros(samples.size()[0], samples.size()[2], dtype=torch.int)
+            segments  = torch.zeros(samples.size()[0], samples.size()[2], dtype=torch.int)
+            masks_pos = torch.zeros(samples.size()[0], samples.size()[2], dtype=torch.long)
+            masked_ts = torch.zeros(samples.size()[0], samples.size()[2], dtype=torch.long)
+
+            for i, x in enumerate(samples):
+                masks_pos[i] = random_mask(x[0], x[2])
+                input_ds[i]  = x[0]
+                segments[i]  = x[1]
+                masked_ts[i] = x[2]
+
+            """
+            Propagate, then calculate loss and finally backpropagate.
+            We do an update of the loss per batch but we keep a record per epoch.
+            """
+            logits_lm, _ = network(input_ds.to('cuda'), segments.to('cuda'), masks_pos.to('cuda'))
+            loss_lm = criterion(logits_lm.transpose(1, 2), masked_ts.to('cuda'))
+            loss_lm.backward()
+            losses.append(loss_lm.item())
+
+        loss = sum(losses) / len(losses)
+        losses.clear()
+
+        print('Epoch:', '%04d' % (epoch + 1), 'CE Loss =', '{:.6f}'.format(loss))
+        optimizer.step()
+
+    # finally save it. We;ll evaluate it manually later
+    torch.save(network.state_dict(), "bert_model")
+

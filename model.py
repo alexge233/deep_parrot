@@ -41,13 +41,13 @@ class Embedding(nn.Module):
         n_seg  = 2
 
         # token embedding
-        self.tok_embed = nn.Embedding(vocab_size, d_model)
+        self.tok_embed = nn.Embedding(vocab_size, d_model).to('cuda')
 
         # position embedding
-        self.pos_embed = nn.Embedding(maxlen, d_model)
+        self.pos_embed = nn.Embedding(maxlen, d_model).to('cuda')
 
         # segment(token type) embedding
-        self.seg_embed = nn.Embedding(n_seg, d_model)
+        self.seg_embed = nn.Embedding(n_seg, d_model).to('cuda')
 
         # Normalisation
         self.norm = nn.LayerNorm(d_model)
@@ -78,8 +78,10 @@ class Embedding(nn.Module):
         pos = torch.arange(seq_len, dtype=torch.long)
         # (seq_len,) -> (batch_size, seq_len)
         pos = pos.unsqueeze(0).expand_as(x)
-        embedding = self.tok_embed(x) + self.pos_embed(pos) + self.seg_embed(seg)
-        return self.norm(embedding)
+
+        # (batch x sequence length x embedding dims (768) 
+        embedding = self.tok_embed(x) + self.pos_embed(pos.to('cuda')) + self.seg_embed(seg)
+        return self.norm(embedding.to('cuda'))
 
 
 def get_attn_pad_mask(seq_q, seq_k):
@@ -102,14 +104,19 @@ def get_attn_pad_mask(seq_q, seq_k):
 
     See here for more:
         https://huggingface.co/docs/transformers/glossary#attention-mask
+
+    There's a pervading bug throughout the entire model code (I blame COPY-PASTING)
     """
     batch_size, len_q = seq_q.size()
     batch_size, len_k = seq_k.size()
+
+    # batch size is 16, len_q is 512 and len_k is 512
     # eq(zero) is PAD token
     # batch_size x 1 x len_k(=len_q), one is masking
     pad_attn_mask = seq_k.data.eq(0).unsqueeze(1)
+    out = pad_attn_mask.expand(batch_size, len_q, len_k)
     # batch_size x len_q x len_k
-    return pad_attn_mask.expand(batch_size, len_q, len_k)
+    return pad_attn_mask.expand(batch_size, len_q, len_k).to('cuda')
 
 
 class PoswiseFeedForwardNet(nn.Module):
@@ -191,7 +198,7 @@ class EncoderLayer(nn.Module):
         embed_dim = 768
         num_heads = 12
         super(EncoderLayer, self).__init__()
-        self.enc_self_attn = nn.MultiheadAttention(embed_dim, num_heads)
+        self.enc_self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.pos_ffn = PoswiseFeedForwardNet()
 
     def forward(self, enc_inputs, enc_self_attn_mask):
@@ -210,7 +217,10 @@ class EncoderLayer(nn.Module):
             https://raw.githubusercontent.com/Skumarr53/Attention-is-All-you-Need-PyTorch/master/Snapshots/MultiHead_Attention.png
         """
         # enc_inputs to same Q,K,V
-        enc_outputs, attn = self.enc_self_attn(enc_inputs, enc_inputs, enc_inputs, enc_self_attn_mask)
+        enc_outputs, attn = self.enc_self_attn(enc_inputs,
+                                               enc_inputs,
+                                               enc_inputs,
+                                               enc_self_attn_mask)
 
         # enc_outputs: [batch_size x len_q x d_model]
         enc_outputs = self.pos_ffn(enc_outputs) 
@@ -231,7 +241,9 @@ class BERT(nn.Module):
         """
         BERT has:
             1. Embedding Layer
-            2. 12 Encoding Layers, each one made of a MultiHead Attention and a Poswise Feed Forward Net
+            2. 12 Encoding Layers, 
+               each one made of a MultiHead Attention and a Poswise Feed Forward Net.
+               I'm using 6 to lower the GPU Memory usage !
             3. One Tanh Activation
             4. one Linear Projection
             5. one GELU activation
@@ -240,7 +252,7 @@ class BERT(nn.Module):
             8. Shared Embedding Weights (Encoder) for the Decoder with
                one Linear Projection using the Decoder weights
         """
-        n_layers = 12
+        n_layers = 6
         d_model  = 768
         self.embedding = Embedding(vocab_size)
         self.layers = nn.ModuleList(
@@ -288,15 +300,19 @@ class BERT(nn.Module):
         - and finally it runs that masked output through the decoder and adds the bias
         - this results in the logits being returned
         """
-        output = self.embedding(input_ids, segment_ids)
+        output = self.embedding(input_ids, segment_ids).to('cuda')
         #
         # NOTE: HuggingFace Tokenizer has already calculated Attention Mask for Padded Sequences
         #       but as a binary mask, whereas this method below will translate the encoded tensor
         #       by keeping intact the Attention values and masking with Zero the non-attention values
         #
-        enc_self_attn_mask = get_attn_pad_mask(input_ids, input_ids)
+        #enc_self_attn_mask = get_attn_pad_mask(input_ids, input_ids)
         for layer in self.layers:
-           output, enc_self_attn = layer(output, enc_self_attn_mask)
+            #
+            # this is expecting the wrong form of tensor [512 x 16]
+            # which is sequence x batch, but I am using batch x sequence
+            #
+            output, enc_self_attn = layer(output, masked_pos)
 
         # output : [batch_size, len, d_model], attn : [batch_size, n_heads, d_mode, d_model]
         # it will be decided by first token(CLS)
