@@ -157,7 +157,7 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(network.parameters(), lr=0.001)
     loader = torch.utils.data.DataLoader(train_data,
-                                         batch_size = 24,
+                                         batch_size = 16,
                                          shuffle = True,
                                          pin_memory = False)
 
